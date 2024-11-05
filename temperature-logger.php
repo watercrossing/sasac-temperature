@@ -2,7 +2,7 @@
 /*
 Plugin Name: Temperature Logger
 Description: Logs water temperature readings from a secure endpoint, displays them using shortcode.
-Version: 1.4
+Version: 1.5
 Author: Ingolf Becker
 */
 
@@ -260,37 +260,123 @@ add_shortcode('temperature_display', 'temperature_display_shortcode');
 
 // Figures!
 
-function get_temperature_data($period) {
+function get_temperature_data($period, $window_size = 3) {
     global $wpdb;
     $table_name = $wpdb->prefix . 'temperature_logs';
     
-    $interval = ($period === '24h') ? 'INTERVAL 24 HOUR' : 'INTERVAL 7 DAY';
+    // Determine interval and query format based on period
+    switch($period) {
+        case '24h':
+            $interval = 'INTERVAL 25 HOUR';
+            $time_format = '%Y-%m-%d %H:%i:00';
+            break;
+        case '7d':
+            $interval = 'INTERVAL 8 DAY';
+            $time_format = '%Y-%m-%d %H:%i:00';
+            break;
+        case '30d':
+            $interval = 'INTERVAL 31 DAY';
+            $time_format = '%Y-%m-%d %H:00:00';
+            break;
+        default:
+            error_log("Invalid period specified: $period");
+            return false;
+    }
     
+    // For periods longer than 24h, only get hourly data
     $query = $wpdb->prepare("
         SELECT 
-            UNIX_TIMESTAMP(CONVERT_TZ(timestamp, '+00:00', 'Europe/London')) as timestamp,
-            water as water_temp,
-            air as air_temp
+            UNIX_TIMESTAMP(CONVERT_TZ(
+                DATE_FORMAT(timestamp, %s),
+                '+00:00', 'Europe/London'
+            )) as timestamp,
+            AVG(water) as water_temp,
+            AVG(air) as air_temp
         FROM $table_name
         WHERE timestamp >= DATE_SUB(NOW(), $interval)
+        GROUP BY DATE_FORMAT(timestamp, %s)
         ORDER BY timestamp ASC
-    ");
+    ", $time_format, $time_format);
     
-    return $wpdb->get_results($query);
+    $results = $wpdb->get_results($query);
+    $total_points = count($results);
+    
+    // Calculate moving averages with configurable window
+    $processed_data = [];
+    
+    // Helper function to calculate average of available points
+    $calculate_average = function($array) {
+        return !empty($array) ? array_sum($array) / count($array) : null;
+    };
+    
+    for ($i = 0; $i < $total_points; $i++) {
+        $current_row = $results[$i];
+        
+        // Calculate cutoff time based on period
+        switch($period) {
+            case '24h':
+                $cutoff = strtotime('-24 hours');
+                break;
+            case '7d':
+                $cutoff = strtotime('-7 days');
+                break;
+            case '30d':
+                $cutoff = strtotime('-30 days');
+                break;
+            default:
+                $cutoff = strtotime('-24 hours');
+        }
+        
+        if ($current_row->timestamp >= $cutoff) {
+            $water_window = [];
+            $air_window = [];
+            
+            // Calculate start and end indices for the window
+            $start_idx = max(0, $i - $window_size);
+            $end_idx = min($total_points - 1, $i + $window_size);
+            
+            // Collect points within the window
+            for ($j = $start_idx; $j <= $end_idx; $j++) {
+                // For 24h: 5 minutes * window_size
+                // For 7d/30d: 1 hour * window_size
+                $max_time_diff = ($period === '24h') ? $window_size * 300 : $window_size * 3600;
+                $time_diff = abs($results[$j]->timestamp - $current_row->timestamp);
+                
+                if ($time_diff <= $max_time_diff) {
+                    $water_window[] = $results[$j]->water_temp;
+                    $air_window[] = $results[$j]->air_temp;
+                }
+            }
+            
+            $processed_row = (object)[
+                'timestamp' => $current_row->timestamp,
+                'water_temp' => $current_row->water_temp,
+                'air_temp' => $current_row->air_temp,
+                'water_temp_sma' => $calculate_average($water_window),
+                'air_temp_sma' => $calculate_average($air_window),
+                'points_in_average' => count($water_window)
+            ];
+            
+            $processed_data[] = $processed_row;
+        }
+    }
+    
+    return $processed_data;
 }
 
+
 // Function to create temperature graph
-function create_temperature_graph($data, $period) {
+function create_temperature_graph($data, $period, $show_raw_data = true, $show_sma = true) {
     // Check if data is valid
     if (empty($data) || !is_array($data) || !isset($data[0]->water_temp) || !isset($data[0]->air_temp)) {
         error_log("Invalid data structure in create_temperature_graph");
         return false;
     }
-
+    
     // Set up image
-    $width = 800;
-    $height = 400;
-    $margin = 50;
+    $width = 1000;
+    $height = 500;
+    $margin = 30;
     $graph_width = $width - 2 * $margin;
     $graph_height = $height - 2 * $margin;
     
@@ -299,70 +385,208 @@ function create_temperature_graph($data, $period) {
         error_log("Failed to create image resource");
         return false;
     }
-
+    
+    // Define colors - use standard colors for raw data if it's the only thing shown
     $white = imagecolorallocate($image, 255, 255, 255);
     $black = imagecolorallocate($image, 0, 0, 0);
     $blue = imagecolorallocate($image, 0, 0, 255);
     $red = imagecolorallocate($image, 255, 0, 0);
+    $light_blue = imagecolorallocate($image, 180, 180, 255);
+    $light_red = imagecolorallocate($image, 255, 180, 180);
     $gray = imagecolorallocate($image, 200, 200, 200);
+    $light_gray = imagecolorallocate($image, 230, 230, 230);
     
     imagefill($image, 0, 0, $white);
     
     // Calculate min and max temperatures
-    $water_temps = array_map(function($item) { return floatval($item->water_temp); }, $data);
-    $air_temps = array_map(function($item) { return floatval($item->air_temp); }, $data);
-    $min_temp = min(min($water_temps), min($air_temps));
-    $max_temp = max(max($water_temps), max($air_temps));
+    $all_temps = [];
+    foreach ($data as $point) {
+        if ($show_raw_data) {
+            $all_temps[] = floatval($point->water_temp);
+            $all_temps[] = floatval($point->air_temp);
+        }
+        if ($show_sma && isset($point->water_temp_sma) && isset($point->air_temp_sma)) {
+            $all_temps[] = floatval($point->water_temp_sma);
+            $all_temps[] = floatval($point->air_temp_sma);
+        }
+    }
+    
+    $min_temp = min($all_temps);
+    $max_temp = max($all_temps);
     $temp_range = $max_temp - $min_temp;
     
     if ($temp_range == 0) {
         $temp_range = 1; // Avoid division by zero
     }
-
+    
     // Draw axes
     imageline($image, $margin, $margin, $margin, $height - $margin, $black);
     imageline($image, $margin, $height - $margin, $width - $margin, $height - $margin, $black);
     
-    // Draw grid lines
+    // Draw horizontal grid lines
     for ($i = 0; $i <= 5; $i++) {
         $y = $margin + $i * $graph_height / 5;
-        imageline($image, $margin, $y, $width - $margin, $y, $gray);
+		if ($i < 5) {
+			imageline($image, $margin, $y, $width - $margin, $y, $gray);
+		}
         $temp = $max_temp - $i * $temp_range / 5;
         imagestring($image, 2, 5, $y - 7, number_format($temp, 1), $black);
     }
     
-    // Plot data
-    $prev_x_water = $prev_y_water = $prev_x_air = $prev_y_air = null;
-    foreach ($data as $index => $point) {
-        $x = $margin + $index * $graph_width / (count($data) - 1);
-        $y_water = $height - $margin - (floatval($point->water_temp) - $min_temp) * $graph_height / $temp_range;
-        $y_air = $height - $margin - (floatval($point->air_temp) - $min_temp) * $graph_height / $temp_range;
-        
-        if ($prev_x_water !== null) {
-            imageline($image, $prev_x_water, $prev_y_water, $x, $y_water, $blue);
-            imageline($image, $prev_x_air, $prev_y_air, $x, $y_air, $red);
+    // Get actual start and end timestamps from data
+    $data_start_time = $data[0]->timestamp;
+    $data_end_time = end($data)->timestamp;
+    
+    // Draw vertical grid lines and x-axis labels
+    if ($period === '24h') {
+        // Find the first and last full hour
+        $first_hour = strtotime(date('Y-m-d H:00:00', $data_start_time));
+        if ($first_hour < $data_start_time) {
+            $first_hour += 3600;
         }
+        $last_hour = strtotime(date('Y-m-d H:00:00', $data_end_time));
         
-        $prev_x_water = $x;
-        $prev_y_water = $y_water;
-        $prev_x_air = $x;
-        $prev_y_air = $y_air;
+        // Draw lines every 3 hours
+        for ($time = $first_hour; $time <= $last_hour; $time += 3600 * 3) {
+            $x_pos = $margin + ($time - $data_start_time) * $graph_width / ($data_end_time - $data_start_time);
+            
+            if ($x_pos >= $margin && $x_pos <= ($width - $margin)) {
+                imageline($image, $x_pos, $margin, $x_pos, $height - $margin, $gray);
+                imagestring($image, 2, $x_pos - 15, $height - $margin + 10, date('H:i', $time), $black);
+            }
+        }
+    } elseif ($period === '7d') {
+        // Find the first and last midnight
+        $first_midnight = strtotime(date('Y-m-d 00:00:00', $data_start_time));
+        if ($first_midnight < $data_start_time) {
+            $first_midnight += 86400;
+        }
+        $last_midnight = strtotime(date('Y-m-d 00:00:00', $data_end_time));
+        
+        // Draw daily lines at midnight
+        for ($time = $first_midnight; $time <= $last_midnight; $time += 86400) {
+            $x_pos = $margin + ($time - $data_start_time) * $graph_width / ($data_end_time - $data_start_time);
+            
+            if ($x_pos >= $margin && $x_pos <= ($width - $margin)) {
+                imageline($image, $x_pos, $margin, $x_pos, $height - $margin, $gray);
+                imagestring($image, 2, $x_pos - 15, $height - $margin + 10, date('d/m', $time), $black);
+            }
+        }
+    } else { // 30d
+        // Find the first and last midnight
+        $first_midnight = strtotime(date('Y-m-d 00:00:00', $data_start_time));
+        if ($first_midnight < $data_start_time) {
+            $first_midnight += 86400;
+        }
+        $last_midnight = strtotime(date('Y-m-d 00:00:00', $data_end_time));
+        
+        // Draw thin lines at every midnight
+        for ($time = $first_midnight; $time <= $last_midnight; $time += 86400) {
+            $x_pos = $margin + ($time - $data_start_time) * $graph_width / ($data_end_time - $data_start_time);
+            
+            if ($x_pos >= $margin && $x_pos <= ($width - $margin)) {
+                // Draw thinner line in light gray for regular days
+                if (($time - $first_midnight) % (86400 * 3) !== 0) {
+                    imageline($image, $x_pos, $margin, $x_pos, $height - $margin, $light_gray);
+                } else {
+                    // Draw normal grid line and label every 3 days
+                    imageline($image, $x_pos, $margin, $x_pos, $height - $margin, $gray);
+                    imagestring($image, 2, $x_pos - 15, $height - $margin + 10, date('d/m', $time), $black);
+                }
+            }
+        }
+    }
+    
+    // Determine which colors to use for raw data
+    $water_color = ($show_sma) ? $light_blue : $blue;
+    $air_color = ($show_sma) ? $light_red : $red;
+    
+    // Plot raw data if enabled
+    if ($show_raw_data) {
+        $prev_x_water = $prev_y_water = $prev_x_air = $prev_y_air = null;
+        foreach ($data as $index => $point) {
+            $x = $margin + $index * $graph_width / (count($data) - 1);
+            $y_water = $height - $margin - (floatval($point->water_temp) - $min_temp) * $graph_height / $temp_range;
+            $y_air = $height - $margin - (floatval($point->air_temp) - $min_temp) * $graph_height / $temp_range;
+            
+            if ($prev_x_water !== null) {
+                imageline($image, $prev_x_water, $prev_y_water, $x, $y_water, $water_color);
+                imageline($image, $prev_x_air, $prev_y_air, $x, $y_air, $air_color);
+            }
+            
+            $prev_x_water = $x;
+            $prev_y_water = $y_water;
+            $prev_x_air = $x;
+            $prev_y_air = $y_air;
+        }
+    }
+    
+    // Plot SMA data if enabled
+    if ($show_sma) {
+        $prev_x_water = $prev_y_water = $prev_x_air = $prev_y_air = null;
+        foreach ($data as $index => $point) {
+            if (!isset($point->water_temp_sma) || !isset($point->air_temp_sma)) {
+                continue;
+            }
+            
+            $x = $margin + $index * $graph_width / (count($data) - 1);
+            
+            if ($point->water_temp_sma !== null) {
+                $y_water = $height - $margin - (floatval($point->water_temp_sma) - $min_temp) * $graph_height / $temp_range;
+                if ($prev_x_water !== null) {
+                    imageline($image, $prev_x_water, $prev_y_water, $x, $y_water, $blue);
+                    if ($show_raw_data) {
+                        imageline($image, $prev_x_water, $prev_y_water - 1, $x, $y_water - 1, $blue);
+                    }
+                }
+                $prev_x_water = $x;
+                $prev_y_water = $y_water;
+            }
+            
+            if ($point->air_temp_sma !== null) {
+                $y_air = $height - $margin - (floatval($point->air_temp_sma) - $min_temp) * $graph_height / $temp_range;
+                if ($prev_x_air !== null) {
+                    imageline($image, $prev_x_air, $prev_y_air, $x, $y_air, $red);
+                    if ($show_raw_data) {
+                        imageline($image, $prev_x_air, $prev_y_air - 1, $x, $y_air - 1, $red);
+                    }
+                }
+                $prev_x_air = $x;
+                $prev_y_air = $y_air;
+            }
+        }
     }
     
     // Add labels
-    $title = ($period === '24h') ? 'Last 24 hours Temperature / C' : 'Last 7 days Temperature / C';
-    imagestring($image, 5, $width / 2 - 100, 10, $title, $black);
-    imagestring($image, 3, $width - 100, 30, 'Water', $blue);
-    imagestring($image, 3, $width - 100, 50, 'Air', $red);
-    
-    // X-axis labels
-    $label_count = ($period === '24h') ? 6 : 7;
-    for ($i = 0; $i < $label_count; $i++) {
-        $x = $margin + $i * $graph_width / ($label_count - 1);
-        $index = floor($i * (count($data) - 1) / ($label_count - 1));
-        $time = date(($period === '24h') ? 'H:i' : 'd/m', $data[$index]->timestamp);
-        imagestring($image, 2, $x - 15, $height - $margin + 10, $time, $black);
+    switch($period) {
+        case '24h':
+            $title = 'Last 24 hours Temperature / C';
+            break;
+        case '7d':
+            $title = 'Last 7 days Temperature / C';
+            break;
+        case '30d':
+            $title = 'Last 30 days Temperature / C';
+            break;
+        default:
+            $title = 'Temperature / C';
     }
+    imagestring($image, 5, $width / 2 - 100, 10, $title, $black);
+    
+    // Update legend based on what's shown
+    if ($show_raw_data && $show_sma) {
+        imagestring($image, 3, $width - 150, 10, 'Water (raw)', $light_blue);
+        imagestring($image, 3, $width - 150, 25, 'Water (SMA)', $blue);
+        imagestring($image, 3, $width - 150, 40, 'Air (raw)', $light_red);
+        imagestring($image, 3, $width - 150, 55, 'Air (SMA)', $red);
+    } else if ($show_raw_data) {
+        imagestring($image, 3, $width - 150, 30, 'Water', $blue);
+        imagestring($image, 3, $width - 150, 50, 'Air', $red);
+    } else if ($show_sma) {
+        imagestring($image, 3, $width - 150, 30, 'Water (SMA)', $blue);
+        imagestring($image, 3, $width - 150, 50, 'Air (SMA)', $red);
+    }
+
     
     // Output image
     ob_start();
@@ -380,18 +604,22 @@ function create_temperature_graph($data, $period) {
 
 // Shortcode to display temperature figures
 function temperature_figures_shortcode() {
-    $data_24h = get_temperature_data('24h');
-    $data_7d = get_temperature_data('7d');
+    $data_24h = get_temperature_data('24h', 3);
+    $data_7d = get_temperature_data('7d', 5);
+    $data_30d = get_temperature_data('30d', 5);
     
 	$output = ""; //"""Data: " . json_encode($data_24h); //var_dump($data_24h);
-    $graph_24h = create_temperature_graph($data_24h, '24h');
-    $graph_7d = create_temperature_graph($data_7d, '7d');
+    $graph_24h = create_temperature_graph($data_24h, '24h', false, true);
+    $graph_7d = create_temperature_graph($data_7d, '7d', false, true);
+    $graph_30d = create_temperature_graph($data_30d, '30d', true, false);
     
     $output .= '<h2>Temperature Graphs</h2>';
     $output .= '<h3>Last 24 Hours</h3>';
     $output .= '<img src="data:image/png;base64,' . $graph_24h . '" alt="24 Hour Temperature Graph">';
     $output .= '<h3>Last 7 Days</h3>';
     $output .= '<img src="data:image/png;base64,' . $graph_7d . '" alt="7 Day Temperature Graph">';
+    $output .= '<h3>Last 30 Days</h3>';
+    $output .= '<img src="data:image/png;base64,' . $graph_30d . '" alt="30 Day Temperature Graph">';
     
 	
     return $output;
