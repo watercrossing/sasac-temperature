@@ -627,3 +627,216 @@ function temperature_figures_shortcode() {
 
 // Register shortcode
 add_shortcode('temperature_figures', 'temperature_figures_shortcode');
+
+// Register REST API endpoints
+// Note: WordPress REST API provides basic type validation only.
+// Additional validation is implemented in the validate_callback and endpoint functions.
+add_action('rest_api_init', function () {
+    // Current temperature endpoint
+    register_rest_route('temperature/v1', '/current', array(
+        'methods' => 'GET',
+        'callback' => 'get_current_temperatures',
+        'permission_callback' => '__return_true'
+    ));
+    
+    // Historical temperature endpoint
+    register_rest_route('temperature/v1', '/historical', array(
+        'methods' => 'GET',
+        'callback' => 'get_historical_temperatures',
+        'args' => array(
+            'start' => array(
+                'required' => true,
+                'type' => 'string',
+                'format' => 'date-time',
+                'description' => 'Start date-time (ISO 8601 format, e.g. 2025-01-10T14:30:00Z)',
+                'validate_callback' => function($param) {
+                    // Additional WordPress-level validation
+                    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?$/', $param)) {
+                        return false;
+                    }
+                    return true;
+                },
+                'sanitize_callback' => function($param) {
+                    // Ensure consistent format
+                    try {
+                        $date = new DateTime($param);
+                        return $date->format('Y-m-d\TH:i:s\Z');
+                    } catch (Exception $e) {
+                        return $param;
+                    }
+                }
+            ),
+            'end' => array(
+                'required' => true,
+                'type' => 'string',
+                'format' => 'date-time',
+                'description' => 'End date-time (ISO 8601 format)',
+                'validate_callback' => function($param) {
+                    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?$/', $param)) {
+                        return false;
+                    }
+                    return true;
+                },
+                'sanitize_callback' => function($param) {
+                    try {
+                        $date = new DateTime($param);
+                        return $date->format('Y-m-d\TH:i:s\Z');
+                    } catch (Exception $e) {
+                        return $param;
+                    }
+                }
+            )
+        ),
+        'permission_callback' => '__return_true'
+    ));
+});
+
+// Callback for current temperature endpoint
+function get_current_temperatures() {
+    $water_temp = get_most_recent_temperature('water');
+    $air_temp = get_most_recent_temperature('air');
+    
+    // Set cache headers based on data freshness
+    $latest_data_time = get_most_recent_update_timestamp();
+    $current_time = new DateTime('now', new DateTimeZone('Europe/London'));
+    $time_difference = $current_time->getTimestamp() - $latest_data_time->getTimestamp();
+    
+    $response = new WP_REST_Response();
+    
+    if ($time_difference <= 300) { // 5 minutes
+        // Data is recent, refresh 5 minutes after the latest data
+        $response->header('Cache-Control', 'max-age=' . max(301 - $time_difference, 5));
+    } else {
+        // Data is more than 5 minutes old, refresh every 30 seconds
+        $response->header('Cache-Control', 'max-age=30');
+    }
+    $response->header('Refresh', '60');
+    
+    if (!$water_temp && !$air_temp) {
+        return new WP_Error('no_data', 'No temperature data available', array('status' => 404));
+    }
+    
+    $data = array(
+        'water' => array(
+            'temperature' => $water_temp ? round(floatval($water_temp->temperature), 2) : null,
+            'timestamp' => $water_temp ? $water_temp->timestamp : null,
+            'unit' => 'celsius'
+        ),
+        'air' => array(
+            'temperature' => $air_temp ? round(floatval($air_temp->temperature), 2) : null,
+            'timestamp' => $air_temp ? $air_temp->timestamp : null,
+            'unit' => 'celsius'
+        ),
+        'last_updated' => current_time('c')
+    );
+    
+    $response->set_data($data);
+    return $response;
+}
+
+// Callback for historical temperature endpoint
+function get_historical_temperatures($request) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'temperature_logs';
+    
+    $start = $request->get_param('start');
+    $end = $request->get_param('end');
+    
+    // Validate and sanitize dates
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?$/', $start) ||
+        !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?$/', $end)) {
+        return new WP_Error(
+            'invalid_date_format',
+            'Invalid date format. Please use ISO 8601 format (YYYY-MM-DDThh:mm:ssZ).',
+            array('status' => 400)
+        );
+    }
+
+    try {
+        $start_date = new DateTime($start);
+        $end_date = new DateTime($end);
+        
+        // Additional validation
+        $now = new DateTime();
+        $min_date = new DateTime('2000-01-01');  // Reasonable minimum date
+        
+        if ($start_date > $end_date) {
+            return new WP_Error(
+                'invalid_date_range',
+                'Start date must be before end date.',
+                array('status' => 400)
+            );
+        }
+        
+        if ($start_date < $min_date || $end_date < $min_date) {
+            return new WP_Error(
+                'date_too_early',
+                'Dates before 2000-01-01 are not supported.',
+                array('status' => 400)
+            );
+        }
+        
+        if ($start_date > $now || $end_date > $now) {
+            return new WP_Error(
+                'future_date',
+                'Future dates are not supported.',
+                array('status' => 400)
+            );
+        }
+        
+        // Limit the date range to prevent excessive queries
+        $range_limit = new DateInterval('P31D'); // 31 days
+        if ($start_date->diff($end_date) > $range_limit) {
+            return new WP_Error(
+                'date_range_too_large',
+                'Date range cannot exceed 31 days.',
+                array('status' => 400)
+            );
+        }
+        
+    } catch (Exception $e) {
+        return new WP_Error(
+            'invalid_date',
+            'Invalid date. Please check your input.',
+            array('status' => 400)
+        );
+    }
+    
+    // Get data from database
+    $query = $wpdb->prepare("
+        SELECT 
+            UNIX_TIMESTAMP(CONVERT_TZ(timestamp, '+00:00', 'Europe/London')) as timestamp,
+            water as water_temp,
+            air as air_temp
+        FROM $table_name
+        WHERE timestamp BETWEEN %s AND %s
+        ORDER BY timestamp ASC
+    ", $start_date->format('Y-m-d H:i:s'), $end_date->format('Y-m-d H:i:s'));
+    
+    $results = $wpdb->get_results($query);
+    
+    if (empty($results)) {
+        return new WP_Error('no_data', 'No data available for the specified period', array('status' => 404));
+    }
+    
+    // Format data
+    $data = array_map(function($row) {
+        return array(
+            'timestamp' => date('c', $row->timestamp),
+            'water' => array(
+                'temperature' => $row->water_temp !== null ? round(floatval($row->water_temp), 2) : null,
+                'unit' => 'celsius'
+            ),
+            'air' => array(
+                'temperature' => $row->air_temp !== null ? round(floatval($row->air_temp), 2) : null,
+                'unit' => 'celsius'
+            )
+        );
+    }, $results);
+    
+    return array(
+        'start_time' => $start,
+        'end_time' => $end,
+        'readings' => $data
+    );
+}
